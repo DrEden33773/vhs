@@ -14,6 +14,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/go-rod/rod v0.116.2
 	github.com/hashicorp/go-version v1.8.0
+	github.com/kardianos/service v1.2.4
 	github.com/mattn/go-isatty v0.0.20
 	github.com/mattn/go-runewidth v0.0.21
 	github.com/muesli/go-app-paths v0.2.2

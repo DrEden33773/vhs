@@ -157,9 +157,11 @@ func waitForTTYD(port int, timeout time.Duration) error {
 
 // Start starts ttyd, browser and everything else needed to create the gif.
 //
-// ttyd and the browser are started concurrently to reduce startup latency,
-// and a readiness probe ensures ttyd is listening before the browser
-// navigates to it.
+// If a daemon is running (see "vhs daemon"), Start reuses its browser
+// instance instead of launching a new one.  Otherwise ttyd and the
+// browser are started concurrently to reduce startup latency, and a
+// readiness probe ensures ttyd is listening before the browser navigates
+// to it.
 func (vhs *VHS) Start() error {
 	vhs.mutex.Lock()
 	defer vhs.mutex.Unlock()
@@ -170,33 +172,26 @@ func (vhs *VHS) Start() error {
 
 	port := randomPort()
 
-	var (
-		browserURL string
-		ttydErr    error
-		browserErr error
-		wg         sync.WaitGroup
-	)
+	// ttyd is always needed — it hosts the terminal for this session.
+	vhs.tty = buildTtyCmd(port, vhs.Options.Shell)
+	if err := vhs.tty.Start(); err != nil {
+		return fmt.Errorf("could not start tty: %w", err)
+	}
 
-	// Launch ttyd and the browser concurrently.
-	wg.Add(2) //nolint:mnd
-	go func() {
-		defer wg.Done()
-		vhs.tty = buildTtyCmd(port, vhs.Options.Shell)
-		ttydErr = vhs.tty.Start()
-	}()
-	go func() {
-		defer wg.Done()
+	// Try to reuse a running daemon's browser.
+	browserURL, daemonErr := probeDaemon()
+
+	if daemonErr != nil {
+		// No daemon available — launch a fresh browser.
+		// ttyd is already started above, so we only need to wait for it and
+		// launch the browser.
 		path, _ := launcher.LookPath()
 		enableNoSandbox := os.Getenv("VHS_NO_SANDBOX") != ""
-		browserURL, browserErr = launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Launch()
-	}()
-	wg.Wait()
-
-	if ttydErr != nil {
-		return fmt.Errorf("could not start tty: %w", ttydErr)
-	}
-	if browserErr != nil {
-		return fmt.Errorf("could not launch browser: %w", browserErr)
+		var err error
+		browserURL, err = launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Launch()
+		if err != nil {
+			return fmt.Errorf("could not launch browser: %w", err)
+		}
 	}
 
 	// Wait for ttyd to be ready before navigating.
@@ -212,7 +207,15 @@ func (vhs *VHS) Start() error {
 
 	vhs.browser = browser
 	vhs.Page = page
-	vhs.close = vhs.browser.Close
+
+	if daemonErr != nil {
+		// We own this browser — close it on teardown.
+		vhs.close = vhs.browser.Close
+	} else {
+		// The daemon owns the browser — only disconnect our handle.
+		vhs.close = func() error { return nil }
+	}
+
 	vhs.started = true
 	return nil
 }

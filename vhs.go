@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,7 +122,44 @@ func New() VHS {
 	}
 }
 
+const (
+	// ttydPollInterval is how often to probe ttyd for readiness.
+	ttydPollInterval = 50 * time.Millisecond
+
+	// ttydPollTimeout is the maximum time to wait for ttyd to become ready.
+	ttydPollTimeout = 10 * time.Second
+)
+
+// waitForTTYD polls ttyd's HTTP endpoint until it responds successfully or
+// the timeout is reached.
+func waitForTTYD(port int, timeout time.Duration) error {
+	url := fmt.Sprintf("http://localhost:%d", port)
+	deadline := time.After(timeout)
+	tick := time.NewTicker(ttydPollInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			return fmt.Errorf("ttyd did not become ready within %s", timeout)
+		case <-tick.C:
+			resp, err := http.Get(url) //nolint:noctx,gosec
+			if err != nil {
+				continue
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+	}
+}
+
 // Start starts ttyd, browser and everything else needed to create the gif.
+//
+// ttyd and the browser are started concurrently to reduce startup latency,
+// and a readiness probe ensures ttyd is listening before the browser
+// navigates to it.
 func (vhs *VHS) Start() error {
 	vhs.mutex.Lock()
 	defer vhs.mutex.Unlock()
@@ -131,18 +169,42 @@ func (vhs *VHS) Start() error {
 	}
 
 	port := randomPort()
-	vhs.tty = buildTtyCmd(port, vhs.Options.Shell)
-	if err := vhs.tty.Start(); err != nil {
-		return fmt.Errorf("could not start tty: %w", err)
+
+	var (
+		browserURL string
+		ttydErr    error
+		browserErr error
+		wg         sync.WaitGroup
+	)
+
+	// Launch ttyd and the browser concurrently.
+	wg.Add(2) //nolint:mnd
+	go func() {
+		defer wg.Done()
+		vhs.tty = buildTtyCmd(port, vhs.Options.Shell)
+		ttydErr = vhs.tty.Start()
+	}()
+	go func() {
+		defer wg.Done()
+		path, _ := launcher.LookPath()
+		enableNoSandbox := os.Getenv("VHS_NO_SANDBOX") != ""
+		browserURL, browserErr = launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Launch()
+	}()
+	wg.Wait()
+
+	if ttydErr != nil {
+		return fmt.Errorf("could not start tty: %w", ttydErr)
+	}
+	if browserErr != nil {
+		return fmt.Errorf("could not launch browser: %w", browserErr)
 	}
 
-	path, _ := launcher.LookPath()
-	enableNoSandbox := os.Getenv("VHS_NO_SANDBOX") != ""
-	u, err := launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Launch()
-	if err != nil {
-		return fmt.Errorf("could not launch browser: %w", err)
+	// Wait for ttyd to be ready before navigating.
+	if err := waitForTTYD(port, ttydPollTimeout); err != nil {
+		return fmt.Errorf("ttyd readiness check failed: %w", err)
 	}
-	browser := rod.New().ControlURL(u).MustConnect()
+
+	browser := rod.New().ControlURL(browserURL).MustConnect()
 	page, err := browser.Page(proto.TargetCreateTarget{URL: fmt.Sprintf("http://localhost:%d", port)})
 	if err != nil {
 		return fmt.Errorf("could not open ttyd: %w", err)

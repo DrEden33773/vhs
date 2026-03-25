@@ -362,7 +362,7 @@ func writeDepsCache(ttydVer string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0o644)
+	_ = os.WriteFile(path, data, 0o600)
 }
 
 // ensureDependencies ensures that all dependencies are correctly installed

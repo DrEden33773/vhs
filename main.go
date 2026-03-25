@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +17,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/vhs/lexer"
 	"github.com/charmbracelet/vhs/parser"
 	version "github.com/hashicorp/go-version"
 	"github.com/mattn/go-isatty"
+	gap "github.com/muesli/go-app-paths"
 	"github.com/spf13/cobra"
 )
 
@@ -303,9 +306,76 @@ func getVersion(program string) *version.Version {
 	return programVersion
 }
 
+// depsCache stores the result of a successful dependency check.
+type depsCache struct {
+	TTYDVersion string `json:"ttyd_version"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+// depsCacheTTL is how long the dependency check cache remains valid.
+const depsCacheTTL = 1 * time.Hour
+
+// depsCachePath returns the path to the dependency check cache file.
+func depsCachePath() (string, error) {
+	scope := gap.NewScope(gap.User, "vhs")
+	dataPath, err := scope.DataPath("deps_check.json")
+	if err != nil {
+		return "", fmt.Errorf("could not determine cache path: %w", err)
+	}
+	return dataPath, nil
+}
+
+// readDepsCache reads and validates the dependency check cache.
+// It returns nil if the cache is missing, expired, or invalid.
+func readDepsCache() *depsCache {
+	path, err := depsCachePath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cache depsCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil
+	}
+	if time.Since(time.Unix(cache.Timestamp, 0)) > depsCacheTTL {
+		return nil
+	}
+	return &cache
+}
+
+// writeDepsCache persists the dependency check result to the cache file.
+func writeDepsCache(ttydVer string) {
+	path, err := depsCachePath()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return
+	}
+	data, err := json.Marshal(depsCache{
+		TTYDVersion: ttydVer,
+		Timestamp:   time.Now().Unix(),
+	})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
 // ensureDependencies ensures that all dependencies are correctly installed
 // and versioned before continuing.
+//
+// Results are cached to avoid repeated file system lookups and process
+// invocations on subsequent runs (see depsCacheTTL).
 func ensureDependencies() error {
+	// Fast path: use cached result when available.
+	if cache := readDepsCache(); cache != nil {
+		return nil
+	}
+
 	_, ffmpegErr := exec.LookPath("ffmpeg")
 	if ffmpegErr != nil {
 		return fmt.Errorf("ffmpeg is not installed. Install it from: http://ffmpeg.org")
@@ -326,6 +396,9 @@ func ensureDependencies() error {
 			ttydMinVersion,
 			"Install the latest version from: https://github.com/tsl0922/ttyd")
 	}
+
+	// Cache the successful result for future runs.
+	writeDepsCache(ttydVersion.String())
 
 	return nil
 }
